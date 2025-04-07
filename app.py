@@ -1,89 +1,85 @@
 import streamlit as st
-import pytesseract
-import cv2
 import re
-import fitz  # PyMuPDF
-from PIL import Image
-import numpy as np
+import requests
+from PIL import Image, ImageEnhance
 from io import BytesIO
+from fitz import open as pdf_open
 
-# OCR config
-CUSTOM_CONFIG = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-TAG_PATTERN = r'WH-\d{4}-[A-Z]{2}-\d{2}-FSL\d{2}'
+# Flexible tag pattern (e.g., WH-0601-PG-89-FSL32)
+# TAG_PATTERN = r"WH[-_]\d{3,5}([-_][A-Z0-9]+){1,4}"
+TAG_PATTERN = r"WH[-_]\d{3,5}[-_][A-Z0-9]{2}[-_]\d{2}[-_](?:FSL|CSL)\d{2}"
 
+
+# OCR.space API key
+OCR_SPACE_API_KEY = "K85818381288957"  # Replace with your own if needed
+
+# Preprocess image before OCR
+def preprocess_for_ocr(image: Image.Image):
+    image = image.convert("L")  # Convert to grayscale
+    enhancer = ImageEnhance.Contrast(image)
+    return enhancer.enhance(2.0)  # Boost contrast
+
+# Extract matching tags
+def extract_tags_from_ocr_text(text):
+    tags = re.findall(TAG_PATTERN, text)
+    return [tag for tag in tags if "FSL" in tag or "CSL" in tag]
+
+# Send image to OCR.space
+def ocr_space_file(file):
+    result = requests.post(
+        'https://api.ocr.space/parse/image',
+        files={"filename": ("image.png", file, "image/png")},  # Fixed: set name + type
+        data={
+            "apikey": OCR_SPACE_API_KEY,
+            "language": "eng",
+            "isOverlayRequired": False,
+        },
+    )
+    return result.json()
+
+# Streamlit UI
 st.set_page_config(page_title="OCR Tag Extractor", layout="wide")
 st.title("📄 OCR Tag Extractor (WH-XXXX-XX-XX-FSLXX)")
 
-uploaded_file = st.file_uploader("Upload PDF or Image", type=["pdf", "png", "jpg", "jpeg"])
-
-def preprocess_image(image: Image.Image):
-    image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                   cv2.THRESH_BINARY_INV, 15, 8)
-    return thresh
-
-def extract_tags_with_boxes(image):
-    data = pytesseract.image_to_data(image, config=CUSTOM_CONFIG, output_type=pytesseract.Output.DICT)
-    boxes = []
-    tags = []
-
-    for i in range(len(data["text"])):
-        word = data["text"][i]
-        if re.fullmatch(TAG_PATTERN, word):
-            tags.append(word)
-            (x, y, w, h) = (data["left"][i], data["top"][i], data["width"][i], data["height"][i])
-            boxes.append((x, y, w, h))
-
-    return tags, boxes, data
-
-def draw_boxes_on_image(image_pil, boxes):
-    image_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-    for (x, y, w, h) in boxes:
-        cv2.rectangle(image_cv, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    return Image.fromarray(cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB))
-
-def pdf_to_images(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    images = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=200)
-        img = Image.open(BytesIO(pix.tobytes("png")))
-        images.append(img)
-    return images
+uploaded_file = st.file_uploader("Upload PDF/Image", type=["pdf", "jpg", "jpeg", "png"])
 
 if uploaded_file:
-    file_ext = uploaded_file.name.split('.')[-1].lower()
+    file_ext = uploaded_file.name.split(".")[-1].lower()
 
-    if file_ext == 'pdf':
-        images = pdf_to_images(uploaded_file)
-        total_pages = len(images)
-        st.info(f"📄 PDF has {total_pages} page(s).")
+    if file_ext == "pdf":
+        doc = pdf_open(stream=uploaded_file.read(), filetype="pdf")
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=300)  # Higher DPI = better clarity
+            img = Image.open(BytesIO(pix.tobytes("png")))
+            images.append(img)
 
-        selected_page = st.slider("Select a page", 1, total_pages, 1)
-        selected_image = images[selected_page - 1]
-        st.image(selected_image, caption=f"Page {selected_page}", use_column_width=True)
+        selected_page = st.slider("Select page", 1, len(images), 1)
+        image_to_ocr = images[selected_page - 1]
 
-        if st.button("🔍 Run OCR on this page"):
-            processed_image = preprocess_image(selected_image)
-            tags, boxes, _ = extract_tags_with_boxes(processed_image)
-            boxed_image = draw_boxes_on_image(selected_image, boxes)
+    else:
+        image_to_ocr = Image.open(uploaded_file)
 
-            st.image(boxed_image, caption="📍 Tags Detected", use_column_width=True)
+    st.image(image_to_ocr, caption="🖼️ Image sent to OCR", use_column_width=True)
 
-            st.subheader("🔍 Extracted Tags")
-            st.write(tags if tags else "No matching tags found.")
+    if st.button("🔍 Run OCR"):
+        processed_image = preprocess_for_ocr(image_to_ocr)
 
-    elif file_ext in ['png', 'jpg', 'jpeg']:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Image", use_column_width=True)
+        buf = BytesIO()
+        processed_image.save(buf, format="PNG")
+        buf.seek(0)
 
-        if st.button("🔍 Run OCR on this image"):
-            processed_image = preprocess_image(image)
-            tags, boxes, _ = extract_tags_with_boxes(processed_image)
-            boxed_image = draw_boxes_on_image(image, boxes)
+        result = ocr_space_file(buf)
 
-            st.image(boxed_image, caption="📍 Tags Detected", use_column_width=True)
+        # Debug: show full API response
+        st.subheader("🧪 Raw OCR JSON")
+        st.json(result)
 
-            st.subheader("🔍 Extracted Tags")
-            st.write(tags if tags else "No matching tags found.")
+        parsed_text = result.get("ParsedResults", [{}])[0].get("ParsedText", "")
+        tags = extract_tags_from_ocr_text(parsed_text)
+
+        st.subheader("🔍 Extracted Tags")
+        st.write(tags if tags else "No matching tags found.")
+
+        with st.expander("📝 Raw OCR Text"):
+            st.text(parsed_text)
